@@ -1,0 +1,628 @@
+================================================================================
+  SMARTKITCHEN API — FRONTEND CONSUMPTION GUIDE
+  Base URL: http://127.0.0.1:8000
+  Auth: Bearer token in header → Authorization: Bearer <access_token>
+================================================================================
+
+════════════════════════════════════════════════════════
+  AUTHENTICATION  (/auth)
+════════════════════════════════════════════════════════
+
+──────────────────────────────────────────────────────
+POST /auth/register
+──────────────────────────────────────────────────────
+Register a new user. Account starts inactive + unverified.
+A verification email is sent automatically.
+
+Body (JSON):
+{
+  "name": "Yassine",
+  "family_name": "Ben Ali",
+  "email": "user@example.com",
+  "password": "secret123",
+  "phone_number": "55123456",      // optional
+  "phone_code": "+216",            // optional, e.g. "+216"
+  "address": {                     // optional
+    "rue": "Rue de la paix",
+    "city": "Tunis",
+    "gouvernorat": "Tunis",
+    "zip_code": "1000"
+  },
+  "role": "user"                   // "user" | "admin" | "manager"
+}
+
+Response 201:
+{ "message": "Registration successful. Please check your email to verify your account." }
+
+Errors: 400 if email already registered.
+
+──────────────────────────────────────────────────────
+GET /auth/verify-email?token=<token>
+──────────────────────────────────────────────────────
+Activate account via the link emailed after registration.
+Token expires after 24 hours.
+
+Response 200: { "message": "Email verified successfully. Your account is now active." }
+Errors: 400 invalid/expired token.
+
+──────────────────────────────────────────────────────
+POST /auth/login
+──────────────────────────────────────────────────────
+Login and get tokens. Account must be verified + active.
+
+Body (JSON):
+{
+  "email": "user@example.com",
+  "password": "secret123"
+}
+
+Response 200:
+{
+  "access_token": "eyJ...",
+  "refresh_token": "eyJ...",
+  "token_type": "bearer"
+}
+
+Errors: 401 wrong credentials, 403 not verified or deactivated.
+→ Store both tokens. Use access_token for all requests.
+
+──────────────────────────────────────────────────────
+POST /auth/refresh
+──────────────────────────────────────────────────────
+Get a new access_token using the refresh_token (when access expires).
+
+Body (JSON): { "refresh_token": "eyJ..." }
+
+Response 200: { "access_token": "eyJ...", "token_type": "bearer" }
+
+──────────────────────────────────────────────────────
+POST /auth/logout
+──────────────────────────────────────────────────────
+Stateless logout — just discard both tokens on the client side.
+
+Response 200: { "message": "Logged out successfully" }
+
+──────────────────────────────────────────────────────
+POST /auth/forgot-password
+──────────────────────────────────────────────────────
+Send a password reset link to an email address.
+Always returns 200 (no email enumeration).
+
+Body (JSON): { "email": "user@example.com" }
+
+──────────────────────────────────────────────────────
+POST /auth/reset-password
+──────────────────────────────────────────────────────
+Set new password using the token from the reset email.
+Token expires after 1 hour.
+
+Body (JSON): { "token": "...", "new_password": "newSecret" }
+
+Response 200: { "message": "Password reset successfully." }
+
+──────────────────────────────────────────────────────
+[ADMIN] GET /auth/admin/users
+──────────────────────────────────────────────────────
+List all users with optional filters + pagination.
+
+Query params:
+  ?skip=0         offset (default 0)
+  ?limit=50       page size (max 500)
+  ?role=user      filter by role: "user" | "admin" | "manager"
+  ?is_active=true filter by active status: true | false
+
+Response:
+{
+  "total": 120,
+  "skip": 0,
+  "limit": 50,
+  "users": [
+    {
+      "id": "uuid",
+      "name": "...",
+      "family_name": "...",
+      "email": "...",
+      "role": "user",
+      "is_active": true,
+      "is_verified": true,
+      "created_at": "2025-01-01T00:00:00Z"
+    }
+  ]
+}
+
+──────────────────────────────────────────────────────
+[ADMIN] POST /auth/admin/users/bulk-create
+──────────────────────────────────────────────────────
+Create multiple users at once. Skips duplicates.
+Created users are immediately active + verified (no email sent).
+
+Body: Array of user objects (same fields as register, without optional address).
+
+Response: { "created": ["email1@...", ...], "skipped_duplicates": ["..."] }
+
+──────────────────────────────────────────────────────
+[ADMIN] PATCH /auth/admin/users/bulk-update
+──────────────────────────────────────────────────────
+Update fields on multiple users.
+
+Body:
+[
+  {
+    "user_id": "uuid",
+    "name": "...",          // all optional
+    "family_name": "...",
+    "phone_number": "...",
+    "phone_code": "...",
+    "role": "user",
+    "is_active": true,
+    "address": { "rue": "...", "city": "...", "gouvernorat": "...", "zip_code": "..." }
+  }
+]
+
+Response: { "updated": ["uuid1", ...], "not_found": [] }
+
+──────────────────────────────────────────────────────
+[ADMIN] POST /auth/admin/users/bulk-activate
+[ADMIN] POST /auth/admin/users/bulk-deactivate
+[ADMIN] DELETE /auth/admin/users/bulk-delete
+──────────────────────────────────────────────────────
+Batch activate / deactivate / permanently delete users.
+
+Body: { "user_ids": ["uuid1", "uuid2", ...] }
+
+──────────────────────────────────────────────────────
+[ADMIN] POST /auth/admin/users/{user_id}/activate
+[ADMIN] POST /auth/admin/users/{user_id}/deactivate
+──────────────────────────────────────────────────────
+Activate or deactivate a single user account.
+
+
+════════════════════════════════════════════════════════
+  PROFILE  (/profile)   🔒 Requires auth
+════════════════════════════════════════════════════════
+
+──────────────────────────────────────────────────────
+GET /profile
+──────────────────────────────────────────────────────
+Get the current logged-in user's full profile.
+
+Response:
+{
+  "id": "uuid",
+  "name": "Yassine",
+  "family_name": "Ben Ali",
+  "email": "user@example.com",
+  "phone_number": "55123456",
+  "phone_code": "+216",
+  "address": {
+    "rue": "...",
+    "city": "...",
+    "gouvernorat": "...",
+    "zip_code": "..."
+  },
+  "avatar_url": "https://supabase.../avatars/uuid.jpg",  // null if not set
+  "role": "user",
+  "is_active": true,
+  "is_verified": true,
+  "created_at": "...",
+  "updated_at": "..."
+}
+
+──────────────────────────────────────────────────────
+PATCH /profile
+──────────────────────────────────────────────────────
+Update profile info. All fields optional. Email cannot be changed.
+
+Body (JSON):
+{
+  "name": "...",
+  "family_name": "...",
+  "phone_number": "...",
+  "phone_code": "+216",
+  "address": { "rue": "...", "city": "...", "gouvernorat": "...", "zip_code": "..." }
+}
+
+Response: Full profile object (same as GET /profile).
+
+──────────────────────────────────────────────────────
+POST /profile/avatar
+──────────────────────────────────────────────────────
+Upload / replace profile photo.
+
+Content-Type: multipart/form-data
+Field: file (jpeg / png / webp, max 5 MB)
+
+Response 200: { "avatar_url": "https://supabase.../avatars/uuid.jpg" }
+Errors: 415 unsupported type, 413 too large.
+
+
+════════════════════════════════════════════════════════
+  STORES  (/smartkitchen-stores)   🔒 Requires auth
+════════════════════════════════════════════════════════
+
+──────────────────────────────────────────────────────
+POST /smartkitchen-stores/my/add
+──────────────────────────────────────────────────────
+User declares store UUIDs they own (Uber store UUIDs).
+Status will be "en attente d'integration" until admin syncs from Uber.
+If the store is already known to SmartKitchen, status is immediately "verified".
+
+Body: { "store_ids": ["uuid1", "uuid2"] }
+
+Response:
+{
+  "results": [
+    { "store_id": "uuid1", "action": "added", "status": "en attente d'integration" },
+    { "store_id": "uuid2", "action": "already_exists", "status": "verified" }
+  ]
+}
+
+──────────────────────────────────────────────────────
+GET /smartkitchen-stores/my
+──────────────────────────────────────────────────────
+List the current user's stores with live status sync.
+Each call re-validates store status against the SmartKitchen master list.
+
+Response:
+[
+  { "id": 1, "store_id": "uuid", "store_name": "Mon Restaurant" }
+]
+
+Store statuses (internal, visible via admin list):
+  "verified"                  → SmartKitchen confirmed as manager
+  "en attente d'integration"  → waiting for admin to sync from Uber
+
+──────────────────────────────────────────────────────
+DELETE /smartkitchen-stores/my/{store_id}
+──────────────────────────────────────────────────────
+Remove a store from the user's list.
+
+──────────────────────────────────────────────────────
+[ADMIN] POST /smartkitchen-stores/admin/sync
+──────────────────────────────────────────────────────
+Pull all SmartKitchen stores from Uber API, upsert into DB,
+and auto-verify any pending user stores.
+
+Response:
+{
+  "synced": 15,
+  "user_stores_verified": 3,
+  "store_ids": ["uuid1", ...]
+}
+
+──────────────────────────────────────────────────────
+[ADMIN] GET /smartkitchen-stores/admin/list
+──────────────────────────────────────────────────────
+List all SmartKitchen stores in the DB.
+
+Query params:
+  ?status_filter=ONLINE    filter by Uber status (ONLINE | OFFLINE | UNKNOWN)
+
+Response: [ { "store_id": "uuid", "store_name": "..." }, ... ]
+
+
+════════════════════════════════════════════════════════
+  ORDER REPORTS  (/order-reports)   🔒 Requires auth
+════════════════════════════════════════════════════════
+
+How it works:
+  Calling GET endpoints triggers a fresh Uber report in the background
+  (fires webhook → processes CSV → saves to DB).
+  The endpoint immediately returns data already stored in DB.
+  Fresh data appears on the next call (or poll).
+
+──────────────────────────────────────────────────────
+GET /order-reports/get-cancelled-orders
+──────────────────────────────────────────────────────
+Trigger + return cancelled orders for user's linked stores.
+Cancelled = Completed(0) AND Ticket Size(0).
+
+Query params:
+  ?start_date=2025-01-01   YYYY-MM-DD, default: 7 days ago
+  ?end_date=2025-01-08     YYYY-MM-DD, capped at today-2 days (Uber lag)
+  ?store_id=uuid           filter to a single store (optional)
+  ?skip=0                  pagination offset
+  ?limit=50                page size (max 500)
+
+Response:
+{
+  "report_period": { "start_date": "...", "end_date": "..." },
+  "triggered_jobs": ["workflow_uuid1"],
+  "trigger_errors": [],
+  "total_stored": 42,
+  "skip": 0,
+  "limit": 50,
+  "cancelled_orders": [
+    {
+      "store_name": "...",
+      "country_code": "FR",
+      "order_id": "...",
+      "order_uuid": "...",
+      "order_status": "...",
+      "menu_item_count": "3",
+      "date_ordered": "2025-01-05",
+      "workflow_uuid": "...",
+      "store_id": "uuid",
+      "remboursement_status": "en attente",
+      "report_job_id": "...",
+      "fetched_at": "..."
+    }
+  ]
+}
+
+──────────────────────────────────────────────────────
+GET /order-reports/get-contested-orders
+──────────────────────────────────────────────────────
+Trigger + return contested orders for user's linked stores.
+
+Query params: same as get-cancelled-orders
+  end_date is capped at today-4 days (Uber contested lag)
+
+Response: same envelope but "contested_orders" array:
+{
+  "id": 1,
+  "order_id": "...",
+  "order_uuid": "...",
+  "store_id": "...",
+  "store_name": "...",
+  "city": "...",
+  "order_issue": "WRONG_ITEM",
+  "inaccurate_items": "...",
+  "ticket_size": "25.50",
+  "customer_refunded": "5.00",
+  "refund_covered_by_merchant": "5.00",  ← key field for matching refunds
+  "refund_not_covered_by_merchant": "0.00",
+  "currency_code": "EUR",
+  "time_customer_ordered": "...",
+  "time_merchant_accepted": "...",
+  "time_customer_refunded": "...",
+  "fulfillment_type": "PICK_UP",
+  "order_channel": "...",
+  "remboursement_status": "en attente",   // "en attente" | "remboursé" | "email envoyé"
+  "report_job_id": "...",
+  "fetched_at": "..."
+}
+
+──────────────────────────────────────────────────────
+GET /order-reports/my-cancelled
+──────────────────────────────────────────────────────
+Read-only list of cancelled orders for the user's stores (no Uber trigger).
+Useful for dashboard listing without triggering a new sync.
+
+Query params:
+  ?store_id=uuid
+  ?remboursement_status=en attente    "en attente" | "remboursé"
+  ?skip=0
+  ?limit=50
+
+Response: { "total", "skip", "limit", "cancelled_orders": [...] }
+
+──────────────────────────────────────────────────────
+GET /order-reports/my-contested
+──────────────────────────────────────────────────────
+Read-only list of contested orders for the user's stores (no Uber trigger).
+
+Query params:
+  ?store_id=uuid
+  ?remboursement_status=en attente    "en attente" | "remboursé" | "email envoyé"
+  ?skip=0
+  ?limit=50
+
+Response: { "total", "skip", "limit", "contested_orders": [...] }
+
+──────────────────────────────────────────────────────
+GET /order-reports/jobs
+──────────────────────────────────────────────────────
+List all report jobs requested by the current user (for status tracking).
+
+Response:
+[
+  {
+    "job_id": "workflow_uuid",
+    "store_id": "uuid",
+    "job_type": "cancelled",    // "cancelled" | "contested" | "payment"
+    "status": "completed",      // "pending" | "completed" | "failed"
+    "created_at": "..."
+  }
+]
+
+──────────────────────────────────────────────────────
+[ADMIN] POST /order-reports/admin/sync-nowV2
+──────────────────────────────────────────────────────
+Trigger a full bulk sync for ALL active SK stores at once
+(1 cancelled report + 1 contested report = 2 API calls total).
+Runs in background thread.
+
+Response: { "message": "Bulk sync started...", "triggered_by": "admin_uuid" }
+
+──────────────────────────────────────────────────────
+[ADMIN] POST /order-reports/admin/payment-syncV2
+──────────────────────────────────────────────────────
+Trigger a PAYMENT_DETAILS_REPORT for all active SK stores.
+Saves only rows where "Other payments description" = "Restaurant refunds".
+Runs in background thread.
+
+Response: { "message": "Payment sync started...", "triggered_by": "admin_uuid" }
+
+
+════════════════════════════════════════════════════════
+  STORE REFUNDS  (/store-refunds)   🔒 Requires auth
+════════════════════════════════════════════════════════
+
+These are payment refunds extracted from Uber's PAYMENT_DETAILS_REPORT.
+They represent actual money Uber refunded to the restaurant.
+
+──────────────────────────────────────────────────────
+GET /store-refunds
+──────────────────────────────────────────────────────
+List store refunds.
+Admin: sees all stores.
+User: sees only their verified stores.
+
+Query params:
+  ?store_id=uuid             filter to a single store
+  ?linked=true               true = linked to an order, false = unlinked only
+  ?skip=0
+  ?limit=50
+
+Response:
+{
+  "total": 10,
+  "skip": 0,
+  "limit": 50,
+  "refunds": [
+    {
+      "id": 1,
+      "store_name": "Mon Restaurant",
+      "store_id": "uuid",
+      "refund_date": "2025-03-15",
+      "amount": "12.50",
+      "payout_reference_id": "PAY-XXX",
+      "linked_order_id": null,      // null = not yet linked to a contested order
+      "report_job_id": "...",
+      "fetched_at": "..."
+    }
+  ]
+}
+
+──────────────────────────────────────────────────────
+GET /store-refunds/suggest-orders
+──────────────────────────────────────────────────────
+For each refund, suggest contested orders where
+refund_covered_by_merchant == refund amount exactly (same store).
+Admin: all active SK stores. User: their verified stores.
+
+Response:
+{
+  "total": 5,
+  "suggestions": [
+    {
+      "refund_id": 1,
+      "store_name": "Mon Restaurant",
+      "refund_amount": "12.50",
+      "refund_date": "2025-03-15",
+      "linked_order_id": null,
+      "contested_candidates": [
+        {
+          "order_id": "F745B",
+          "order_uuid": "uuid-...",
+          "refund_covered_by_merchant": "12.50",
+          "date": "2025-03-10T12:00:00"
+        }
+      ]
+    }
+  ]
+}
+
+→ Use this to let admin/user manually link a refund to its order.
+
+──────────────────────────────────────────────────────
+[ADMIN] PATCH /store-refunds/{refund_id}/link-order
+──────────────────────────────────────────────────────
+Manually link a refund to a contested order by order ID.
+
+Path: refund_id (integer)
+Body: { "linked_order_id": "F745B" }
+
+Response: Full refund object with updated linked_order_id.
+
+
+════════════════════════════════════════════════════════
+  ORDER PROOFS & REFUND EMAILS  (/order-proofs)
+════════════════════════════════════════════════════════
+
+──────────────────────────────────────────────────────
+[ADMIN] POST /order-proofs/upload
+──────────────────────────────────────────────────────
+Upload one or more proof images for contested orders.
+IMPORTANT: filename must be the Order ID (e.g. F745B.jpg, A123C.png).
+The system auto-matches proofs to orders by filename = order_id.
+
+Content-Type: multipart/form-data
+Field: files   (multiple files allowed, same field name repeated)
+Allowed types: image/jpeg, image/png, image/webp
+Max size: 10 MB per file
+
+Response 201:
+{
+  "uploaded": [
+    { "filename": "F745B.jpg", "url": "https://supabase.../order-proofs/F745B.jpg" },
+    { "filename": "A123C.png", "url": "..." }
+  ],
+  "failed": [
+    { "filename": "bad.gif", "error": "Unsupported type 'image/gif'" }
+  ]
+}
+
+──────────────────────────────────────────────────────
+POST /order-proofs/send-refund-emails          ← User
+[ADMIN] POST /order-proofs/admin/send-refund-emails  ← Admin
+──────────────────────────────────────────────────────
+Send refund request emails to Uber support via Mailjet.
+
+User version: only processes contested orders for their own verified stores.
+Admin version: processes all active SK stores.
+
+For each contested order with remboursement_status == "en attente":
+  1. Looks up proof file in Supabase (tries F745B.jpg / .jpeg / .png / .webp)
+  2. If proof found → sends email to Uber support with the proof attached
+  3. Updates remboursement_status to "email envoyé"
+  4. If no proof → skipped (skipped_no_proof++)
+
+No body needed.
+
+Response:
+{
+  "sent": 3,
+  "skipped_no_proof": 2,
+  "errors": 0
+}
+
+Note: Admin version also runs automatically every 24 hours via scheduler.
+
+remboursement_status values (for all order types):
+  "en attente"   → default, waiting for action
+  "remboursé"    → refund confirmed
+  "email envoyé" → refund email sent to Uber via Mailjet
+
+
+════════════════════════════════════════════════════════
+  COMMON PATTERNS
+════════════════════════════════════════════════════════
+
+Authentication header (all protected endpoints):
+  Authorization: Bearer <access_token>
+
+Token lifecycle:
+  1. Login → get access_token + refresh_token
+  2. Use access_token for all requests
+  3. On 401 → call POST /auth/refresh with refresh_token → get new access_token
+  4. On logout → discard both tokens client-side
+
+Pagination (where available):
+  ?skip=0&limit=50    → first page
+  ?skip=50&limit=50   → second page
+  Use "total" in response to calculate total pages.
+
+Role-based access:
+  "user"   → own stores, own orders, own profile
+  "admin"  → everything, including bulk ops + sync triggers
+  Endpoints prefixed with /admin/ or labeled [ADMIN] require role == "admin"
+
+Typical user flow:
+  1. Register → verify email → login
+  2. Add store UUIDs → GET /smartkitchen-stores/my (check status)
+  3. GET /order-reports/get-cancelled-orders → see cancelled orders
+  4. GET /order-reports/get-contested-orders → see contested orders
+  5. GET /store-refunds → see payment refunds from Uber
+  6. GET /store-refunds/suggest-orders → match refunds to contested orders
+  7. POST /order-proofs/send-refund-emails → send Mailjet emails with proof
+
+Typical admin flow:
+  1. POST /smartkitchen-stores/admin/sync → pull all stores from Uber
+  2. POST /order-reports/admin/sync-nowV2 → bulk sync all orders
+  3. POST /order-reports/admin/payment-syncV2 → sync payment refunds
+  4. POST /order-proofs/upload → upload proof images (named by Order ID)
+  5. POST /order-proofs/admin/send-refund-emails → send all pending emails
+
+================================================================================

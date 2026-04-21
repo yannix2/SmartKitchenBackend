@@ -1,0 +1,512 @@
+import threading
+from datetime import date, datetime, timedelta, timezone
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, field_validator
+from sqlalchemy.orm import Session
+
+from app.api.users_auth import _require_admin
+from app.core.security import get_current_user
+from app.db.session import get_db
+from app.models.contested_order import ContestedOrder
+from app.models.order_report_job import OrderReportJob
+from app.models.reported_order import ReportedOrder
+from app.models.smartkitchen_store import SmartKitchenStore
+from app.models.user import User
+from app.models.user_store import UserStore
+from app.services.sync_service import run_bulk_sync, run_payment_sync
+from app.services.uber_service import create_report, get_uber_token
+
+router = APIRouter(prefix="/order-reports", tags=["order-reports"])
+
+# Uber lag: ORDER_HISTORY_REPORT = 2 days, ORDER_ERRORS_TRANSACTION_REPORT = 4 days
+UBER_CANCELLED_LAG_DAYS = 2
+UBER_CONTESTED_LAG_DAYS = 4
+
+
+def _max_end_date(lag_days: int) -> date:
+    return (datetime.now(timezone.utc) - timedelta(days=lag_days)).date()
+
+
+# ── Schema ─────────────────────────────────────────────────────────────────────
+
+class ReportRequestPayload(BaseModel):
+    store_id: str
+    start_date: str   # YYYY-MM-DD
+    end_date: str     # YYYY-MM-DD
+
+    @field_validator("end_date")
+    @classmethod
+    def cap_end_date(cls, v: str) -> str:
+        max_end = _max_end_date(UBER_CANCELLED_LAG_DAYS)
+        try:
+            requested = date.fromisoformat(v)
+        except ValueError:
+            raise ValueError("end_date must be YYYY-MM-DD")
+        if requested > max_end:
+            return max_end.isoformat()
+        return v
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _request_report_for_store(
+    store_id: str,
+    user_id: str,
+    start_date: str,
+    end_date: str,
+    token: str,
+    db: Session,
+    report_type: str = "ORDER_HISTORY_REPORT",
+    job_type: str = "cancelled",
+) -> tuple[str | None, dict]:
+    result = create_report(token, [store_id], start_date, end_date, report_type)
+    print(f"📋 create_report [{report_type}] store={store_id} → {result}")
+    workflow_id = result.get("workflow_id") or result.get("job_id")
+    if not workflow_id:
+        return None, result
+    db.add(OrderReportJob(
+        job_id=workflow_id,
+        user_id=user_id,
+        store_id=store_id,
+        job_type=job_type,
+        status="pending",
+    ))
+    return workflow_id, result
+
+
+# ── Main endpoint: trigger + return saved orders ───────────────────────────────
+
+@router.get("/get-cancelled-orders")
+def get_cancelled_orders(
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD. Defaults to 7 days ago."),
+    end_date: Optional[str] = Query(None, description=f"YYYY-MM-DD. Capped at today-{UBER_CANCELLED_LAG_DAYS} days."),
+    store_id: Optional[str] = Query(None, description="Filter to a single store."),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Trigger a fresh ORDER_HISTORY_REPORT on Uber for all linked stores
+    and return all cancelled orders already stored in the database.
+    Cancelled orders = Completed? == 0 AND Ticket Size == 0.
+    """
+    max_end = _max_end_date(UBER_CANCELLED_LAG_DAYS)
+
+    # Resolve dates
+    resolved_end = min(
+        date.fromisoformat(end_date) if end_date else max_end,
+        max_end,
+    )
+    resolved_start = (
+        date.fromisoformat(start_date)
+        if start_date
+        else resolved_end - timedelta(days=7)
+    )
+
+    if resolved_start > resolved_end:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"start_date must be before end_date (max end_date is {max_end})",
+        )
+
+    # Fetch user's linked active stores only
+    active_sk_ids = {
+        s.store_id for s in
+        db.query(SmartKitchenStore).filter(SmartKitchenStore.is_active != 0).all()
+    }
+    stores_query = db.query(UserStore).filter(UserStore.user_id == current_user.id)
+    if store_id:
+        stores_query = stores_query.filter(UserStore.store_id == store_id)
+    stores = [s for s in stores_query.all() if s.store_id in active_sk_ids]
+
+    if not stores:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No linked active stores found for your account.",
+        )
+
+    # Request fresh reports
+    token_data = get_uber_token()
+    token = token_data.get("access_token")
+    triggered_jobs = []
+    trigger_errors = []
+    if token:
+        for s in stores:
+            wf_id, raw = _request_report_for_store(
+                s.store_id,
+                current_user.id,
+                resolved_start.isoformat(),
+                resolved_end.isoformat(),
+                token,
+                db,
+            )
+            if wf_id:
+                triggered_jobs.append(wf_id)
+            else:
+                trigger_errors.append({"store_id": s.store_id, "uber_response": raw})
+        db.commit()
+    else:
+        trigger_errors.append({"error": "could_not_obtain_token", "uber_response": token_data})
+
+    # Return already-stored cancelled orders
+    q = db.query(ReportedOrder).filter(ReportedOrder.user_id == current_user.id)
+    if store_id:
+        q = q.filter(ReportedOrder.store_id == store_id)
+    total = q.count()
+    orders = q.order_by(ReportedOrder.fetched_at.desc()).offset(skip).limit(limit).all()
+
+    return {
+        "report_period": {
+            "start_date": resolved_start.isoformat(),
+            "end_date": resolved_end.isoformat(),
+        },
+        "triggered_jobs": triggered_jobs,
+        "trigger_errors": trigger_errors,
+        "total_stored": total,
+        "skip": skip,
+        "limit": limit,
+        "cancelled_orders": [
+            {
+                
+                "store_name": r.store_name,
+                "country_code": r.country_code,
+                "order_id": r.order_id,
+                "order_uuid": r.order_uuid,
+                "order_status": r.order_status,
+                "menu_item_count": r.menu_item_count,
+                "date_ordered": r.date_ordered,
+                "workflow_uuid": r.workflow_uuid,
+                "store_id": r.store_id,
+                "remboursement_status": r.remboursement_status,
+                "report_job_id": r.report_job_id,
+                "fetched_at": r.fetched_at,
+            }
+            for r in orders
+        ],
+    }
+
+
+# ── Contested orders ───────────────────────────────────────────────────────────
+
+@router.get("/get-contested-orders")
+def get_contested_orders(
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD. Defaults to 7 days ago."),
+    end_date: Optional[str] = Query(None, description=f"YYYY-MM-DD. Capped at today-{UBER_CONTESTED_LAG_DAYS} days."),
+    store_id: Optional[str] = Query(None, description="Filter to a single store."),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Trigger a fresh ORDER_ERRORS_TRANSACTION_REPORT on Uber for all linked stores
+    and return all contested orders (non remboursé only) stored in the database.
+    Refund Covered by Merchant == 0 rows are skipped (already remboursé).
+    """
+    max_end = _max_end_date(UBER_CONTESTED_LAG_DAYS)
+
+    resolved_end = min(
+        date.fromisoformat(end_date) if end_date else max_end,
+        max_end,
+    )
+    resolved_start = (
+        date.fromisoformat(start_date)
+        if start_date
+        else resolved_end - timedelta(days=7)
+    )
+
+    if resolved_start > resolved_end:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"start_date must be before end_date (max end_date is {max_end})",
+        )
+
+    active_sk_ids = {
+        s.store_id for s in
+        db.query(SmartKitchenStore).filter(SmartKitchenStore.is_active != 0).all()
+    }
+    stores_query = db.query(UserStore).filter(UserStore.user_id == current_user.id)
+    if store_id:
+        stores_query = stores_query.filter(UserStore.store_id == store_id)
+    stores = [s for s in stores_query.all() if s.store_id in active_sk_ids]
+
+    if not stores:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No linked active stores found for your account.",
+        )
+
+    # Trigger fresh reports
+    token_data = get_uber_token()
+    token = token_data.get("access_token")
+    triggered_jobs = []
+    trigger_errors = []
+    if token:
+        for s in stores:
+            wf_id, raw = _request_report_for_store(
+                s.store_id,
+                current_user.id,
+                resolved_start.isoformat(),
+                resolved_end.isoformat(),
+                token,
+                db,
+                report_type="ORDER_ERRORS_TRANSACTION_REPORT",
+                job_type="contested",
+            )
+            if wf_id:
+                triggered_jobs.append(wf_id)
+            else:
+                trigger_errors.append({"store_id": s.store_id, "uber_response": raw})
+        db.commit()
+    else:
+        trigger_errors.append({"error": "could_not_obtain_token", "uber_response": token_data})
+
+    # Return already-stored contested orders
+    q = db.query(ContestedOrder).filter(ContestedOrder.user_id == current_user.id)
+    if store_id:
+        q = q.filter(ContestedOrder.store_id == store_id)
+    total = q.count()
+    orders = q.order_by(ContestedOrder.fetched_at.desc()).offset(skip).limit(limit).all()
+
+    return {
+        "report_period": {
+            "start_date": resolved_start.isoformat(),
+            "end_date": resolved_end.isoformat(),
+        },
+        "triggered_jobs": triggered_jobs,
+        "trigger_errors": trigger_errors,
+        "total_stored": total,
+        "skip": skip,
+        "limit": limit,
+        "contested_orders": [
+            {
+                "id": r.id,
+                "order_id": r.order_id,
+                "order_uuid": r.order_uuid,
+                "workflow_uuid": r.workflow_uuid,
+                "store_id": r.store_id,
+                "store_name": r.store_name,
+                "city": r.city,
+                "order_issue": r.order_issue,
+                "inaccurate_items": r.inaccurate_items,
+                "ticket_size": r.ticket_size,
+                "customer_refunded": r.customer_refunded,
+                "refund_covered_by_merchant": r.refund_covered_by_merchant,
+                "refund_not_covered_by_merchant": r.refund_not_covered_by_merchant,
+                "currency_code": r.currency_code,
+                "time_customer_ordered": r.time_customer_ordered,
+                "time_merchant_accepted": r.time_merchant_accepted,
+                "time_customer_refunded": r.time_customer_refunded,
+                "fulfillment_type": r.fulfillment_type,
+                "order_channel": r.order_channel,
+                "remboursement_status": r.remboursement_status,
+                "report_job_id": r.report_job_id,
+                "fetched_at": r.fetched_at,
+            }
+            for r in orders
+        ],
+    }
+
+
+# ── My orders (read-only) ──────────────────────────────────────────────────────
+
+@router.get("/my-cancelled")
+def my_cancelled_orders(
+    store_id: Optional[str] = Query(None),
+    remboursement_status: Optional[str] = Query(None, description="en attente | remboursé"),
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Return all cancelled orders for stores linked to the authenticated user.
+    Filters by the user's linked store_ids — no user_id stored on the order.
+    """
+    active_sk_ids = {
+        s.store_id for s in
+        db.query(SmartKitchenStore).filter(SmartKitchenStore.is_active != 0).all()
+    }
+    linked_store_ids = [
+        us.store_id for us in
+        db.query(UserStore).filter(UserStore.user_id == current_user.id).all()
+        if us.store_id in active_sk_ids
+    ]
+    if not linked_store_ids:
+        return {"total": 0, "skip": skip, "limit": limit, "cancelled_orders": []}
+
+    q = db.query(ReportedOrder).filter(ReportedOrder.store_id.in_(linked_store_ids))
+    if store_id:
+        q = q.filter(ReportedOrder.store_id == store_id)
+    if remboursement_status:
+        q = q.filter(ReportedOrder.remboursement_status == remboursement_status)
+    if start_date:
+        q = q.filter(ReportedOrder.date_ordered >= start_date)
+    if end_date:
+        q = q.filter(ReportedOrder.date_ordered <= end_date + "T23:59:59")
+
+    total = q.count()
+    orders = q.order_by(ReportedOrder.fetched_at.desc()).offset(skip).limit(limit).all()
+    return {
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "cancelled_orders": [{
+            "store_name": r.store_name,
+            "country_code": r.country_code,
+            "order_id": r.order_id,
+            "order_uuid": r.order_uuid,
+            "order_status": r.order_status,
+            "menu_item_count": r.menu_item_count,
+            "date_ordered": r.date_ordered,
+            "workflow_uuid": r.workflow_uuid,
+            "store_id": r.store_id,
+            "remboursement_status": r.remboursement_status,
+            "report_job_id": r.report_job_id,
+            "fetched_at": r.fetched_at,
+        }
+            for r in orders
+        ],
+    }
+
+
+@router.get("/my-contested")
+def my_contested_orders(
+    store_id: Optional[str] = Query(None),
+    remboursement_status: Optional[str] = Query(None, description="en attente | remboursé"),
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Return all contested orders for stores linked to the authenticated user.
+    Filters by the user's linked store_ids — no user_id stored on the order.
+    """
+    active_sk_ids = {
+        s.store_id for s in
+        db.query(SmartKitchenStore).filter(SmartKitchenStore.is_active != 0).all()
+    }
+    linked_store_ids = [
+        us.store_id for us in
+        db.query(UserStore).filter(UserStore.user_id == current_user.id).all()
+        if us.store_id in active_sk_ids
+    ]
+    if not linked_store_ids:
+        return {"total": 0, "skip": skip, "limit": limit, "contested_orders": []}
+
+    q = db.query(ContestedOrder).filter(ContestedOrder.store_id.in_(linked_store_ids))
+    if store_id:
+        q = q.filter(ContestedOrder.store_id == store_id)
+    if remboursement_status:
+        q = q.filter(ContestedOrder.remboursement_status == remboursement_status)
+    if start_date:
+        q = q.filter(ContestedOrder.time_customer_ordered >= start_date)
+    if end_date:
+        q = q.filter(ContestedOrder.time_customer_ordered <= end_date + "T23:59:59")
+
+    total = q.count()
+    orders = q.order_by(ContestedOrder.fetched_at.desc()).offset(skip).limit(limit).all()
+    return {
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "contested_orders": [
+            {
+                "id": r.id,
+                "store_id": r.store_id,
+                "store_name": r.store_name,
+                "city": r.city,
+                "country_code": r.country_code,
+                "order_id": r.order_id,
+                "order_uuid": r.order_uuid,
+                "workflow_uuid": r.workflow_uuid,
+                "order_issue": r.order_issue,
+                "inaccurate_items": r.inaccurate_items,
+                "ticket_size": r.ticket_size,
+                "currency_code": r.currency_code,
+                "customer_refunded": r.customer_refunded,
+                "refund_covered_by_merchant": r.refund_covered_by_merchant,
+                "refund_not_covered_by_merchant": r.refund_not_covered_by_merchant,
+                "time_customer_ordered": r.time_customer_ordered,
+                "time_merchant_accepted": r.time_merchant_accepted,
+                "time_customer_refunded": r.time_customer_refunded,
+                "fulfillment_type": r.fulfillment_type,
+                "order_channel": r.order_channel,
+                "remboursement_status": r.remboursement_status,
+                "fetched_at": r.fetched_at,
+            }
+            for r in orders
+        ],
+    }
+
+
+@router.post("/admin/sync-nowV2")
+def admin_sync_now_v2(admin: User = Depends(_require_admin)):
+    """
+    Admin — bulk sync: fires 2 Uber reports (one cancelled, one contested)
+    covering ALL active SK store UUIDs at once, then links each CSV row back
+    to its store via store_name. 100 stores = 2 API calls instead of 200.
+    """
+    admin_id = str(admin.id)
+    thread = threading.Thread(
+        target=run_bulk_sync,
+        kwargs={"user_id": admin_id},
+        daemon=True,
+    )
+    thread.start()
+    return {
+        "message": "Bulk sync started. 2 reports requested for all SK stores — rows linked by store name.",
+        "triggered_by": admin_id,
+    }
+
+
+@router.post("/admin/payment-syncV2")
+def admin_payment_sync_v2(admin: User = Depends(_require_admin)):
+    """Admin — fire a single PAYMENT_DETAILS_REPORT for all active SK stores."""
+    admin_id = str(admin.id)
+    thread = threading.Thread(
+        target=run_payment_sync,
+        kwargs={"user_id": admin_id},
+        daemon=True,
+    )
+    thread.start()
+    return {
+        "message": "Payment sync started. PAYMENT_DETAILS_REPORT requested for all SK stores.",
+        "triggered_by": admin_id,
+    }
+
+
+
+
+# ── Jobs status ────────────────────────────────────────────────────────────────
+
+@router.get("/jobs")
+def list_report_jobs(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List all report jobs requested by the current user."""
+    jobs = (
+        db.query(OrderReportJob)
+        .filter(OrderReportJob.user_id == current_user.id)
+        .order_by(OrderReportJob.created_at.desc())
+        .all()
+    )
+    return [
+        {
+            "job_id": j.job_id,
+            "store_id": j.store_id,
+            "job_type": j.job_type,
+            "status": j.status,
+            "created_at": j.created_at,
+        }
+        for j in jobs
+    ]
