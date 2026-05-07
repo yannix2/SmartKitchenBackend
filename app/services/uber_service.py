@@ -75,6 +75,24 @@ def get_order(token: str, order_id: str) -> dict:
     except ValueError:
         return {"error": "invalid_response", "text": response.text, "status": response.status_code}
 
+def get_order_details(token: str, order_id: str, expand: str | None = "carts,deliveries,payment") -> dict:
+    """
+    GET /v1/delivery/order/{order_id} — full MerchantOrder.
+    `expand` is a comma-separated list of: carts, deliveries, payment.
+    Includes carts (line items + totals) which is what we need to compute order amounts.
+    """
+    params = {"expand": expand} if expand else None
+    response = requests.get(
+        f"{_base_url()}/v1/delivery/order/{order_id}",
+        headers={"Authorization": f"Bearer {token}", "Accept-Encoding": "gzip"},
+        params=params,
+    )
+    try:
+        return response.json()
+    except ValueError:
+        return {"error": "invalid_response", "text": response.text, "status": response.status_code}
+
+
 def get_report_status(token: str, workflow_id: str) -> dict:
     response = requests.get(
         f"{_base_url()}/v1/eats/report/{workflow_id}",

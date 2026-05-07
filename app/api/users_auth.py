@@ -26,10 +26,10 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 # ── Schemas ────────────────────────────────────────────────────────────────────
 
 class AddressSchema(BaseModel):
-    rue: Optional[str] = None
-    city: Optional[str] = None
-    gouvernorat: Optional[str] = None
-    zip_code: Optional[str] = None
+    rue: str
+    city: str
+    gouvernorat: str
+    zip_code: str
 
 
 class RegisterRequest(BaseModel):
@@ -37,10 +37,10 @@ class RegisterRequest(BaseModel):
     family_name: str
     email: EmailStr
     password: str
-    phone_number: Optional[str] = None
-    phone_code: Optional[str] = None  # e.g. "+216"
-    address: Optional[AddressSchema] = None
-    role: str = "user"  # user | admin | manager
+    phone_number: str
+    phone_code: str  # e.g. "+216"
+    address: AddressSchema
+    role: str = "user"  # user | admin | agent
 
 
 class LoginRequest(BaseModel):
@@ -79,9 +79,9 @@ class BulkUserCreateItem(BaseModel):
     family_name: str
     email: EmailStr
     password: str
-    phone_number: Optional[str] = None
-    phone_code: Optional[str] = None
-    address: Optional[AddressSchema] = None
+    phone_number: str
+    phone_code: str
+    address: AddressSchema
     role: str = "user"
 
 
@@ -100,13 +100,23 @@ class BulkIdsRequest(BaseModel):
     user_ids: List[str]
 
 
-# ── Dependency: admin only ─────────────────────────────────────────────────────
+# ── Dependency: role gates ────────────────────────────────────────────────────
 
 def _require_admin(current_user: User = Depends(get_current_user)) -> User:
     if current_user.role != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required",
+        )
+    return current_user
+
+
+def _require_admin_or_agent(current_user: User = Depends(get_current_user)) -> User:
+    """Allow either an admin or a call/support agent."""
+    if current_user.role not in ("admin", "agent"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin or agent access required",
         )
     return current_user
 
@@ -170,10 +180,10 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
         hashed_password=hash_password(payload.password),
         phone_number=payload.phone_number,
         phone_code=payload.phone_code,
-        address_rue=payload.address.rue if payload.address else None,
-        address_city=payload.address.city if payload.address else None,
-        address_gouvernorat=payload.address.gouvernorat if payload.address else None,
-        address_zip_code=payload.address.zip_code if payload.address else None,
+        address_rue=payload.address.rue,
+        address_city=payload.address.city,
+        address_gouvernorat=payload.address.gouvernorat,
+        address_zip_code=payload.address.zip_code,
         role=payload.role,
         is_active=False,
         is_verified=False,
@@ -380,6 +390,7 @@ def list_users(
                 "name": u.name,
                 "family_name": u.family_name,
                 "email": u.email,
+                "avatar_url": u.avatar_url,
                 "role": u.role,
                 "is_active": u.is_active,
                 "is_verified": u.is_verified,
@@ -409,10 +420,10 @@ def bulk_create_users(
             hashed_password=hash_password(item.password),
             phone_number=item.phone_number,
             phone_code=item.phone_code,
-            address_rue=item.address.rue if item.address else None,
-            address_city=item.address.city if item.address else None,
-            address_gouvernorat=item.address.gouvernorat if item.address else None,
-            address_zip_code=item.address.zip_code if item.address else None,
+            address_rue=item.address.rue,
+            address_city=item.address.city,
+            address_gouvernorat=item.address.gouvernorat,
+            address_zip_code=item.address.zip_code,
             role=item.role,
             is_active=True,
             is_verified=True,
@@ -552,9 +563,9 @@ def get_user_detail(
 def activate_user(
     user_id: str,
     db: Session = Depends(get_db),
-    _admin: User = Depends(_require_admin),
+    _staff: User = Depends(_require_admin_or_agent),
 ):
-    """Admin — activate a user account."""
+    """Admin/agent — activate a user account."""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
@@ -567,9 +578,9 @@ def activate_user(
 def deactivate_user(
     user_id: str,
     db: Session = Depends(get_db),
-    _admin: User = Depends(_require_admin),
+    _staff: User = Depends(_require_admin_or_agent),
 ):
-    """Admin — deactivate a user account."""
+    """Admin/agent — deactivate a user account."""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
@@ -577,9 +588,58 @@ def deactivate_user(
     db.commit()
     return {"message": f"User {user_id} has been deactivated"}
 
+
+# ── Admin/agent: support actions on a user ────────────────────────────────────
+
+class AdminSetPassword(BaseModel):
+    new_password: str
+
+
+@router.post("/admin/users/{user_id}/set-password")
+def admin_set_password(
+    user_id: str,
+    payload: AdminSetPassword,
+    db: Session = Depends(get_db),
+    staff: User = Depends(_require_admin_or_agent),
+):
+    """
+    Admin/agent — set a new password for a user (support action).
+    Used by call agents to help users who forgot their password during onboarding.
+    """
+    if len(payload.new_password) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must be at least 8 characters",
+        )
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    # Don't let agents change another admin's password
+    if user.role == "admin" and staff.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot reset an admin's password")
+
+    user.hashed_password = hash_password(payload.new_password)
+    # Invalidate any pending reset tokens
+    user.reset_password_token = None
+    user.reset_password_token_expires = None
+    db.commit()
+    return {"message": f"Password updated for {user.email}"}
+
 @router.get("/me")
-def get_current_user(current_user: User = Depends(get_current_user)):
+def get_me(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """Get the current authenticated user's profile."""
+    from app.models.abonnement import Abonnement
+    if current_user.role in ("admin", "agent"):
+        is_subscribed = True
+    else:
+        ab = db.query(Abonnement).filter(Abonnement.user_id == current_user.id).first()
+        is_subscribed = bool(ab and ab.status in ("active", "cancelling"))
+
     return {
         "id": current_user.id,
         "name": current_user.name,
@@ -593,8 +653,13 @@ def get_current_user(current_user: User = Depends(get_current_user)):
             "gouvernorat": current_user.address_gouvernorat,
             "zip_code": current_user.address_zip_code,
         },
+        "avatar_url": current_user.avatar_url,
         "role": current_user.role,
         "is_active": current_user.is_active,
         "is_verified": current_user.is_verified,
+        "is_subscribed": is_subscribed,
+        "is_verified_bymanager": current_user.is_verified_bymanager,
+        "onboarding_status": current_user.onboarding_status,
+        "rejection_reason": current_user.rejection_reason,
         "created_at": current_user.created_at,
     }

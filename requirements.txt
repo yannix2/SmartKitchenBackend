@@ -25,3 +25,5 @@ typing_extensions==4.15.0
 uvicorn==0.42.0
 python-multipart
 apscheduler==3.10.4
+stripe>=8.0.0
+twilio>=9.0.0

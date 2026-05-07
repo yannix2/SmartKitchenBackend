@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime
+from sqlalchemy import Column, Float, Integer, String, DateTime
 from app.db.base import Base
 from datetime import datetime, timezone
 
@@ -26,3 +26,9 @@ class ReportedOrder(Base):
     # Remboursement
     remboursement_status = Column(String, nullable=False, default="en attente")
     fetched_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    # Admin-entered amount (Uber CSV always reports ticket_size=0 for cancelled
+    # orders; admin pulls the real amount from the Uber Eats Manager dashboard
+    # and stores it here so a refund email can be sent).
+    manual_amount = Column(Float, nullable=True)
+    refund_email_sent_at = Column(DateTime(timezone=True), nullable=True)

@@ -4,6 +4,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, field_validator
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.api.users_auth import _require_admin
@@ -74,6 +75,69 @@ def _request_report_for_store(
         status="pending",
     ))
     return workflow_id, result
+
+
+# ── Reusable helper: kick off both reports for one user's verified stores ────
+
+def trigger_user_sync(
+    user_id: str,
+    db: Session,
+    days_back: int = 30,
+    max_stores: int | None = None,
+) -> dict:
+    """
+    Fire both ORDER_HISTORY_REPORT (cancelled) and ORDER_ERRORS_TRANSACTION_REPORT
+    (contested) for the user's verified+integrated stores. Returns the workflow IDs
+    so callers can monitor. Safe to call from non-request contexts (e.g. on approve).
+    """
+    from app.models.user_store import STATUS_VERIFIED  # late import to avoid cycles
+
+    active_sk_ids = {
+        s.store_id for s in
+        db.query(SmartKitchenStore).filter(SmartKitchenStore.is_active != 0).all()
+    }
+    user_stores = (
+        db.query(UserStore)
+        .filter(UserStore.user_id == user_id, UserStore.status == STATUS_VERIFIED)
+        .all()
+    )
+    stores = [s for s in user_stores if s.store_id in active_sk_ids]
+    if max_stores:
+        stores = stores[:max_stores]
+
+    if not stores:
+        return {"triggered": [], "errors": [{"reason": "no_verified_integrated_stores"}]}
+
+    token_data = get_uber_token()
+    token = token_data.get("access_token")
+    if not token:
+        return {"triggered": [], "errors": [{"reason": "no_uber_token", "raw": token_data}]}
+
+    end_cancelled = _max_end_date(UBER_CANCELLED_LAG_DAYS)
+    end_contested = _max_end_date(UBER_CONTESTED_LAG_DAYS)
+    start_cancelled = (end_cancelled - timedelta(days=days_back)).isoformat()
+    start_contested = (end_contested - timedelta(days=days_back)).isoformat()
+
+    triggered, errors = [], []
+    for s in stores:
+        wf_c, raw_c = _request_report_for_store(
+            s.store_id, user_id, start_cancelled, end_cancelled.isoformat(),
+            token, db, report_type="ORDER_HISTORY_REPORT", job_type="cancelled",
+        )
+        (triggered if wf_c else errors).append(
+            {"store_id": s.store_id, "type": "cancelled", "workflow_id": wf_c, "raw": None if wf_c else raw_c}
+        )
+
+        wf_x, raw_x = _request_report_for_store(
+            s.store_id, user_id, start_contested, end_contested.isoformat(),
+            token, db, report_type="ORDER_ERRORS_TRANSACTION_REPORT", job_type="contested",
+        )
+        (triggered if wf_x else errors).append(
+            {"store_id": s.store_id, "type": "contested", "workflow_id": wf_x, "raw": None if wf_x else raw_x}
+        )
+
+    db.commit()
+    return {"triggered": triggered, "errors": errors}
 
 
 # ── Main endpoint: trigger + return saved orders ───────────────────────────────
@@ -319,6 +383,7 @@ def my_cancelled_orders(
     remboursement_status: Optional[str] = Query(None, description="en attente | remboursé"),
     start_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
     end_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    search: Optional[str] = Query(None, description="Search by order ID or store name"),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
     current_user: User = Depends(get_current_user),
@@ -349,6 +414,12 @@ def my_cancelled_orders(
         q = q.filter(ReportedOrder.date_ordered >= start_date)
     if end_date:
         q = q.filter(ReportedOrder.date_ordered <= end_date + "T23:59:59")
+    if search:
+        term = f"%{search.strip()}%"
+        q = q.filter(or_(
+            ReportedOrder.order_id.ilike(term),
+            ReportedOrder.store_name.ilike(term),
+        ))
 
     total = q.count()
     orders = q.order_by(ReportedOrder.fetched_at.desc()).offset(skip).limit(limit).all()
@@ -369,6 +440,8 @@ def my_cancelled_orders(
             "remboursement_status": r.remboursement_status,
             "report_job_id": r.report_job_id,
             "fetched_at": r.fetched_at,
+            "manual_amount": r.manual_amount,
+            "refund_email_sent_at": r.refund_email_sent_at,
         }
             for r in orders
         ],
@@ -381,6 +454,7 @@ def my_contested_orders(
     remboursement_status: Optional[str] = Query(None, description="en attente | remboursé"),
     start_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
     end_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    search: Optional[str] = Query(None, description="Search by order ID or store name"),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
     current_user: User = Depends(get_current_user),
@@ -411,6 +485,12 @@ def my_contested_orders(
         q = q.filter(ContestedOrder.time_customer_ordered >= start_date)
     if end_date:
         q = q.filter(ContestedOrder.time_customer_ordered <= end_date + "T23:59:59")
+    if search:
+        term = f"%{search.strip()}%"
+        q = q.filter(or_(
+            ContestedOrder.order_id.ilike(term),
+            ContestedOrder.store_name.ilike(term),
+        ))
 
     total = q.count()
     orders = q.order_by(ContestedOrder.fetched_at.desc()).offset(skip).limit(limit).all()
@@ -510,3 +590,86 @@ def list_report_jobs(
         }
         for j in jobs
     ]
+
+
+# ── Admin: manual amount on a cancelled order + send refund email ────────────
+
+class CancelledAmountPayload(BaseModel):
+    manual_amount: float
+
+
+@router.patch("/admin/cancelled-orders/{order_id}/amount")
+def set_cancelled_amount(
+    order_id: str,
+    payload: CancelledAmountPayload,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(_require_admin),
+):
+    """Admin — set the manual amount on a cancelled order."""
+    if payload.manual_amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than 0")
+
+    order = db.query(ReportedOrder).filter(
+        (ReportedOrder.order_id == order_id) | (ReportedOrder.order_uuid == order_id)
+    ).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Cancelled order not found")
+
+    order.manual_amount = payload.manual_amount
+    db.commit()
+    db.refresh(order)
+    return {
+        "order_id": order.order_id,
+        "order_uuid": order.order_uuid,
+        "manual_amount": order.manual_amount,
+        "refund_email_sent_at": order.refund_email_sent_at,
+    }
+
+
+@router.post("/admin/cancelled-orders/{order_id}/send-refund")
+def send_cancelled_refund(
+    order_id: str,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(_require_admin),
+):
+    """
+    Admin — send a refund-request email to Uber support for a cancelled order.
+    Requires the manual_amount to be set first via PATCH .../amount.
+    """
+    from app.services.email_service import send_cancelled_refund_email
+
+    order = db.query(ReportedOrder).filter(
+        (ReportedOrder.order_id == order_id) | (ReportedOrder.order_uuid == order_id)
+    ).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Cancelled order not found")
+
+    if not order.manual_amount or order.manual_amount <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Set the manual_amount on this order before sending the refund email.",
+        )
+
+    sent = send_cancelled_refund_email(
+        restaurant_name=order.store_name or order.store_id,
+        restaurant_uuid=order.store_id,
+        order_number=order.order_id or order.order_uuid or "",
+        amount_eur=float(order.manual_amount),
+    )
+
+    if not sent:
+        raise HTTPException(
+            status_code=502,
+            detail="Mailjet did not accept the message. Check backend logs for the exact error.",
+        )
+
+    order.refund_email_sent_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(order)
+    return {
+        "order_id": order.order_id,
+        "order_uuid": order.order_uuid,
+        "manual_amount": order.manual_amount,
+        "refund_email_sent_at": order.refund_email_sent_at,
+        "message": "Refund email sent.",
+    }

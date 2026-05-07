@@ -9,19 +9,19 @@ class User(Base):
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
 
-    # Personal info
-    name = Column(String, nullable=True)
-    family_name = Column(String, nullable=True)
+    # Personal info — required at registration
+    name = Column(String, nullable=False)
+    family_name = Column(String, nullable=False)
     email = Column(String, unique=True, nullable=False, index=True)
     hashed_password = Column(String, nullable=False)
-    phone_number = Column(String, nullable=True)
-    phone_code = Column(String, nullable=True)  # e.g. "+216"
+    phone_number = Column(String, nullable=False)
+    phone_code = Column(String, nullable=False)  # e.g. "+216"
 
-    # Address
-    address_rue = Column(String, nullable=True)
-    address_city = Column(String, nullable=True)
-    address_gouvernorat = Column(String, nullable=True)
-    address_zip_code = Column(String, nullable=True)
+    # Address — required at registration
+    address_rue = Column(String, nullable=False)
+    address_city = Column(String, nullable=False)
+    address_gouvernorat = Column(String, nullable=False)
+    address_zip_code = Column(String, nullable=False)
 
     # Profile photo
     avatar_url = Column(String, nullable=True)
@@ -32,8 +32,14 @@ class User(Base):
     # Subscription
     abonnement_id = Column(String, nullable=True)
 
+    # Onboarding / CRM
+    is_verified_bymanager = Column(Boolean, default=False)
+    # not_started | pending_call | pending_approval | approved | rejected
+    onboarding_status = Column(String, default="not_started")
+    rejection_reason = Column(String, nullable=True)
+
     # Role & status
-    role = Column(String, default="user")  # user | admin | manager
+    role = Column(String, default="user")  # user | admin | agent
     is_active = Column(Boolean, default=False)
 
     # Email verification

@@ -171,6 +171,124 @@ def send_contested_refund_email(
         return False
 
 
+def send_cancelled_refund_email(
+    restaurant_name: str,
+    restaurant_uuid: str,
+    order_number: str,
+    amount_eur: float,
+) -> bool:
+    """
+    Send a cancelled-order refund request to Uber support via Mailjet.
+    Unlike contested, no proof attachment — admin enters the amount manually
+    (the Uber Eats Manager dashboard is the source of truth for cancelled
+    orders since the CSV reports ticket_size=0).
+    Returns True if sent.
+    """
+    mailjet = _get_mailjet()
+    if mailjet is None:
+        logger.warning("Mailjet credentials not configured — skipping cancelled refund email for order %s", order_number)
+        return False
+
+    recipient = settings.UBER_SUPPORT_EMAIL
+    if not recipient:
+        logger.warning("UBER_SUPPORT_EMAIL not set — skipping cancelled refund email for order %s", order_number)
+        return False
+
+    amount_str = f"{amount_eur:,.2f} €".replace(",", " ").replace(".", ",")
+    subject = f"Demande de remboursement — Commande annulée {order_number}"
+    body = (
+        f"Bonjour,\n\n"
+        f"Nous sollicitons le remboursement de la commande annulée suivante :\n\n"
+        f"- Restaurant : {restaurant_name}\n"
+        f"- UUID restaurant : {restaurant_uuid}\n"
+        f"- Numéro de commande : {order_number}\n"
+        f"- Montant : {amount_str}\n\n"
+        f"Cette commande a été annulée et n'a pas été facturée au client. "
+        f"Merci de bien vouloir traiter cette demande de remboursement.\n\n"
+        f"Cordialement,"
+    )
+
+    data = {
+        "Messages": [
+            {
+                "From": {
+                    "Email": settings.MAILJET_FROM_EMAIL,
+                    "Name": settings.MAILJET_FROM_NAME,
+                },
+                "To": [{"Email": recipient, "Name": "Uber Eats Support"}],
+                "Subject": subject,
+                "TextPart": body,
+            }
+        ]
+    }
+
+    try:
+        result = mailjet.send.create(data=data)
+        if result.status_code == 200:
+            logger.info("Cancelled refund email sent for order %s", order_number)
+            return True
+        logger.error(
+            "Mailjet error for cancelled order %s: status=%s body=%s",
+            order_number, result.status_code, result.json(),
+        )
+        return False
+    except Exception as exc:
+        logger.error("Failed to send cancelled refund email for order %s: %s", order_number, exc)
+        return False
+
+
+# ── CRM onboarding emails ─────────────────────────────────────────────────────
+
+def send_onboarding_received_email(to_email: str, name: str) -> None:
+    """Notify user their onboarding form was received and a call is coming."""
+    _send(
+        to_email, name,
+        "Welcome to SmartKitchen — Your application is under review",
+        f"Hello {name},\n\n"
+        f"Thank you for completing your SmartKitchen onboarding form!\n\n"
+        f"Our team has received your application and one of our agents will call you "
+        f"at your preferred time to walk you through the platform, explain our process, "
+        f"and answer any questions you may have.\n\n"
+        f"You will be fully set up and ready to recover your refunds as soon as your "
+        f"account is approved.\n\n"
+        f"If you have any urgent questions in the meantime, feel free to reply to this email.\n\n"
+        f"Best regards,\n"
+        f"SmartKitchen Team",
+    )
+
+
+def send_approval_email(to_email: str, name: str) -> None:
+    """Notify user their account has been approved by a manager."""
+    _send(
+        to_email, name,
+        "Your SmartKitchen account has been approved!",
+        f"Hello {name},\n\n"
+        f"Great news — your SmartKitchen account has been approved!\n\n"
+        f"You now have full access to the platform. Log in to subscribe and start "
+        f"recovering your Uber Eats refunds automatically.\n\n"
+        f"If you have any questions, do not hesitate to contact our team.\n\n"
+        f"Best regards,\n"
+        f"SmartKitchen Team",
+    )
+
+
+def send_rejection_email(to_email: str, name: str, reason: str) -> None:
+    """Notify user their application was rejected with a reason."""
+    _send(
+        to_email, name,
+        "Update on your SmartKitchen application",
+        f"Hello {name},\n\n"
+        f"Thank you for your interest in SmartKitchen.\n\n"
+        f"After reviewing your application, we are unfortunately unable to approve "
+        f"your account at this time.\n\n"
+        f"Reason: {reason}\n\n"
+        f"If you believe this is an error or your situation has changed, please do not "
+        f"hesitate to contact us and we will be happy to review your case again.\n\n"
+        f"Best regards,\n"
+        f"SmartKitchen Team",
+    )
+
+
 # ── Refund emails (existing) ───────────────────────────────────────────────────
 
 def send_refund_email(

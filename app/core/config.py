@@ -29,5 +29,14 @@ class Settings:
     SUPABASE_URL = os.getenv("SUPABASE_URL", "")
     SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
+    # Twilio
+    TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+    TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+    TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "")   # your Twilio number
+    TWILIO_TWIML_APP_SID = os.getenv("TWILIO_TWIML_APP_SID", "")
+    TWILIO_API_KEY = os.getenv("TWILIO_API_KEY", "")
+    TWILIO_API_SECRET = os.getenv("TWILIO_API_SECRET", "")
+    BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+
 
 settings = Settings()
